@@ -19,6 +19,7 @@ package nodeutilization
 import (
 	"context"
 	"fmt"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,6 +27,7 @@ import (
 	"sigs.k8s.io/descheduler/pkg/api"
 	nodeutil "sigs.k8s.io/descheduler/pkg/descheduler/node"
 
+	"k8s.io/apimachinery/pkg/types"
 	podutil "sigs.k8s.io/descheduler/pkg/descheduler/pod"
 	"sigs.k8s.io/descheduler/pkg/framework/plugins/nodeutilization/classifier"
 	"sigs.k8s.io/descheduler/pkg/framework/plugins/nodeutilization/normalizer"
@@ -49,7 +51,7 @@ var _ frameworktypes.BalancePlugin = &HighNodeUtilization{}
 // to calculate nodes' utilization and not the actual resource usage.
 type HighNodeUtilizationCordoner struct {
 	handle         frameworktypes.Handle
-	args           *HighNodeUtilizationArgs
+	args           *HighNodeUtilizationCordonerArgs
 	podFilter      func(pod *v1.Pod) bool
 	criteria       []any
 	resourceNames  []v1.ResourceName
@@ -61,10 +63,10 @@ type HighNodeUtilizationCordoner struct {
 func NewHighNodeUtilizationCordoner(
 	genericArgs runtime.Object, handle frameworktypes.Handle,
 ) (frameworktypes.Plugin, error) {
-	args, ok := genericArgs.(*HighNodeUtilizationArgs)
+	args, ok := genericArgs.(*HighNodeUtilizationCordonerArgs)
 	if !ok {
 		return nil, fmt.Errorf(
-			"want args to be of type HighNodeUtilizationArgs, got %T",
+			"want args to be of type HighNodeUtilizationCordonerArgs, got %T",
 			genericArgs,
 		)
 	}
@@ -138,6 +140,35 @@ func (h *HighNodeUtilizationCordoner) cordonNode(ctx context.Context, nodeName s
 		return fmt.Errorf("failed to cordon node: %v", err)
 	}
 
+	return nil
+}
+
+func (h *HighNodeUtilizationCordoner) uncordonNode(ctx context.Context, nodeName string) error {
+	client := h.handle.ClientSet()
+
+	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node %q: %w", nodeName, err)
+	}
+
+	if !node.Spec.Unschedulable {
+		klog.V(2).InfoS("Node is already schedulable", "node", nodeName)
+		return nil
+	}
+
+	node.Spec.Unschedulable = false
+
+	// Remove cordon timestamp annotation if present
+	if node.Annotations != nil {
+		delete(node.Annotations, NodeTimeSinceCordonAnnotation)
+	}
+
+	_, err = client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to uncordon node %q: %w", nodeName, err)
+	}
+
+	klog.InfoS("Successfully uncordoned node", "node", nodeName)
 	return nil
 }
 
@@ -255,10 +286,76 @@ func (h *HighNodeUtilizationCordoner) Balance(ctx context.Context, nodes []*v1.N
 	// sorts the nodes by the usage in ascending order.
 	sortNodesByUsage(lowNodes, true)
 
-	// Cordon the lowest utilised node
-	nodeName := lowNodes[0].node.Name
-	if err := h.cordonNode(ctx, nodeName); err != nil {
-		klog.ErrorS(err, "Failed to cordon node", "node", nodeName)
+	minUnderutilized, _ := time.ParseDuration(h.args.MinTimeUnderutilized)
+	maxCordonDuration, _ := time.ParseDuration(h.args.MaxCordonDuration)
+	now := time.Now()
+
+	for _, nodeInfo := range lowNodes {
+		node := nodeInfo.node
+		nodeName := node.Name
+
+		// Check if node is cordoned
+		if node.Spec.Unschedulable {
+			// Check cordon annotation
+			if ts, ok := node.Annotations[NodeTimeSinceCordonAnnotation]; ok {
+				cordonTime, err := time.Parse(time.RFC3339, ts)
+				if err != nil {
+					klog.ErrorS(err, "Failed to parse cordon timestamp", "node", nodeName)
+					continue
+				}
+				// Uncordon if over max duration
+				if now.Sub(cordonTime) > maxCordonDuration {
+					klog.InfoS("Node cordoned too long, uncordoning", "node", nodeName)
+					if err := h.uncordonNode(ctx, nodeName); err != nil {
+						klog.ErrorS(err, "Failed to uncordon node", "node", nodeName)
+					}
+				}
+			}
+			continue
+		}
+
+		// Skip if already being tracked as underutilized
+		firstSeenStr := node.Annotations[NodeUnderUtilizedTimeAnnotation]
+		var firstSeen time.Time
+		var err error
+
+		if firstSeenStr != "" {
+			firstSeen, err = time.Parse(time.RFC3339, firstSeenStr)
+			if err != nil {
+				klog.ErrorS(err, "Failed to parse underutilized timestamp", "node", nodeName)
+				continue
+			}
+		} else {
+			// Annotate node with current time as first underutilized
+			patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`,
+				NodeUnderUtilizedTimeAnnotation, now.Format(time.RFC3339))
+			_, err := h.handle.ClientSet().CoreV1().Nodes().Patch(ctx, nodeName,
+				types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+			if err != nil {
+				klog.ErrorS(err, "Failed to annotate node with underutilized timestamp", "node", nodeName)
+			} else {
+				klog.InfoS("Annotated node as underutilized", "node", nodeName)
+			}
+			continue
+		}
+
+		// If underutilized long enough, cordon
+		if now.Sub(firstSeen) > minUnderutilized {
+			klog.InfoS("Cordon threshold met, cordoning node", "node", nodeName)
+			if err := h.cordonNode(ctx, nodeName); err != nil {
+				klog.ErrorS(err, "Failed to cordon node", "node", nodeName)
+			} else {
+				// Set cordon timestamp
+				patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`,
+					NodeTimeSinceCordonAnnotation, now.Format(time.RFC3339))
+				_, err := h.handle.ClientSet().CoreV1().Nodes().Patch(ctx, nodeName,
+					types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+				if err != nil {
+					klog.ErrorS(err, "Failed to annotate node with cordon timestamp", "node", nodeName)
+				}
+			}
+			break // Only cordon one node at a time
+		}
 	}
 
 	return nil
