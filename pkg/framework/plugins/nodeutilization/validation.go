@@ -15,6 +15,7 @@ package nodeutilization
 
 import (
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/descheduler/pkg/api"
@@ -29,6 +30,43 @@ func ValidateHighNodeUtilizationArgs(obj runtime.Object) error {
 	err := validateThresholds(args.Thresholds)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func ValidateHighNodeUtilizationCordonerArgs(obj runtime.Object) error {
+	// First, validate the base args
+	baseErr := ValidateHighNodeUtilizationArgs(obj)
+	if baseErr != nil {
+		return baseErr
+	}
+
+	args, ok := obj.(*HighNodeUtilizationCordonerArgs)
+	if !ok {
+		return fmt.Errorf("expected HighNodeUtilizationCordonerArgs, got %T", obj)
+	}
+
+	// Validate MinTimeUnderutilized
+	if args.MinTimeUnderutilized != "" {
+		d, err := time.ParseDuration(args.MinTimeUnderutilized)
+		if err != nil {
+			return fmt.Errorf("invalid minTimeUnderutilized duration: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("minTimeUnderutilized must be greater than 0")
+		}
+	}
+
+	// Validate MaxCordonDuration
+	if args.MaxCordonDuration != "" {
+		d, err := time.ParseDuration(args.MaxCordonDuration)
+		if err != nil {
+			return fmt.Errorf("invalid maxCordonDuration duration: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("maxCordonDuration must be greater than 0")
+		}
 	}
 
 	return nil

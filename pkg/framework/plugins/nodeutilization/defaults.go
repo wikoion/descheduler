@@ -50,3 +50,15 @@ func SetDefaults_HighNodeUtilizationArgs(obj runtime.Object) {
 		args.NumberOfNodes = 0
 	}
 }
+
+// SetDefaults_HighNodeUtilizationArgs
+// TODO: Fill out defaults
+func SetDefaults_HighNodeUtilizationCordonerArgs(obj runtime.Object) {
+	args := obj.(*HighNodeUtilizationArgs)
+	if args.Thresholds == nil {
+		args.Thresholds = nil
+	}
+	if args.NumberOfNodes == 0 {
+		args.NumberOfNodes = 0
+	}
+}
