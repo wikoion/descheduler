@@ -8,27 +8,44 @@ data:
   policy.yaml: |
     apiVersion: "descheduler/v1alpha2"
     kind: "DeschedulerPolicy"
+    maxNoOfPodsToEvictPerNamespace: 5
     profiles:
-      - name: ProfileName
-        pluginConfig:
-        - name: "DefaultEvictor"
-        - name: "RemovePodsViolatingInterPodAntiAffinity"
-        - name: "RemoveDuplicates"
-        - name: "LowNodeUtilization"
-          args:
-            thresholds:
-              "cpu" : 20
-              "memory": 20
-              "pods": 20
-            targetThresholds:
-              "cpu" : 50
-              "memory": 50
-              "pods": 50
-        plugins:
-          balance:
-            enabled:
-              - "LowNodeUtilization"
-              - "RemoveDuplicates"
-          deschedule:
-            enabled:
-              - "RemovePodsViolatingInterPodAntiAffinity"
+    - name: ToolingNodes
+      pluginConfig:
+      - name: DefaultEvictor
+        args:
+          evictFailedBarePods: true
+          evictLocalStoragePods: true
+          nodeFit: true
+          nodeSelector: node-role.kubernetes.io/control-plane!=true
+          priorityThreshold:
+            value: 3999999
+      - name: RemovePodsViolatingNodeAffinity
+        args:
+          nodeAffinityType:
+          - preferredDuringSchedulingIgnoredDuringExecution
+      - name: HighNodeUtilization
+        args:
+          thresholds:
+            cpu: 50
+            memory: 50
+            pods: 20
+          numberOfNodes: 1
+      - name: HighNodeUtilizationCordoner
+        args:
+          thresholds:
+            cpu: 50
+            memory: 50
+            pods: 20
+          numberOfNodes: 1
+          minTimeUnderutilized: "10m"
+          maxCordonDuration: "30m"
+      plugins:
+        balance:
+          enabled:
+          - HighNodeUtilization
+          - HighNodeUtilizationCordoner
+        deschedule:
+          enabled:
+          - RemovePodsViolatingNodeAffinity
+

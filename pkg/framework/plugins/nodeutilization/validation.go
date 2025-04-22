@@ -35,19 +35,19 @@ func ValidateHighNodeUtilizationArgs(obj runtime.Object) error {
 	return nil
 }
 
+// ValidateHighNodeUtilizationCordonerArgs validates the arguments for the HighNodeUtilizationCordoner plugin.
 func ValidateHighNodeUtilizationCordonerArgs(obj runtime.Object) error {
-	// First, validate the base args
-	baseErr := ValidateHighNodeUtilizationArgs(obj)
-	if baseErr != nil {
-		return baseErr
-	}
-
 	args, ok := obj.(*HighNodeUtilizationCordonerArgs)
 	if !ok {
 		return fmt.Errorf("expected HighNodeUtilizationCordonerArgs, got %T", obj)
 	}
 
-	// Validate MinTimeUnderutilized
+	// Validate embedded HighNodeUtilizationArgs
+	if err := ValidateHighNodeUtilizationArgs(&args.HighNodeUtilizationArgs); err != nil {
+		return fmt.Errorf("invalid HighNodeUtilizationArgs: %w", err)
+	}
+
+	// Validate minTimeUnderutilized
 	if args.MinTimeUnderutilized != "" {
 		d, err := time.ParseDuration(args.MinTimeUnderutilized)
 		if err != nil {
@@ -58,7 +58,7 @@ func ValidateHighNodeUtilizationCordonerArgs(obj runtime.Object) error {
 		}
 	}
 
-	// Validate MaxCordonDuration
+	// Validate maxCordonDuration
 	if args.MaxCordonDuration != "" {
 		d, err := time.ParseDuration(args.MaxCordonDuration)
 		if err != nil {

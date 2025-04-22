@@ -17,6 +17,9 @@ spec:
     spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: descheduler-sa
+      imagePullSecrets:
+        - name: gar-docker-secret
+        - name: gar-tubernetes-docker-secret
       containers:
         - name: descheduler
           image: us-docker.pkg.dev/influxdb2-artifacts/tubernetes/descheduler-cordoner:latest
