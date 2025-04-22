@@ -26,12 +26,14 @@ data:
             cpu: 50
             memory: 50
             pods: 20
+          numberOfNodes: 0
       - name: HighNodeUtilizationCordoner
         args:
           thresholds:
             cpu: 50
             memory: 50
             pods: 20
+          numberOfNodes: 0
           nodeSelector: node-role.kubernetes.io/control-plane!=true
           minTimeUnderutilized: "5m"
           maxCordonDuration: "10m"

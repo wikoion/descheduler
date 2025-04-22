@@ -19,6 +19,7 @@ package nodeutilization
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -204,6 +205,8 @@ func (h *HighNodeUtilizationCordoner) drainNode(ctx context.Context, nodeName st
 		IgnoreAllDaemonSets: true,
 		DeleteEmptyDirData:  true,
 		Timeout:             0,
+		Out:                 os.Stdout,
+		ErrOut:              os.Stderr,
 		OnPodDeletedOrEvicted: func(pod *v1.Pod, usingEviction bool) {
 			klog.Infof("Pod %s/%s evicted (usingEviction=%v)", pod.Namespace, pod.Name, usingEviction)
 		},
@@ -371,7 +374,7 @@ func (h *HighNodeUtilizationCordoner) Balance(ctx context.Context, nodes []*v1.N
 				if now.Sub(cordonTime) > maxCordonDuration {
 					klog.InfoS("Node cordoned too long, draining", "node", nodeName)
 					if err := h.drainNode(ctx, nodeName); err != nil {
-						klog.ErrorS(err, "Failed to uncordon node", "node", nodeName)
+						klog.ErrorS(err, "Failed to drain node", "node", nodeName)
 					}
 				}
 			}
