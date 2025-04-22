@@ -54,7 +54,7 @@ func SetDefaults_HighNodeUtilizationArgs(obj runtime.Object) {
 // SetDefaults_HighNodeUtilizationArgs
 // TODO: Fill out defaults
 func SetDefaults_HighNodeUtilizationCordonerArgs(obj runtime.Object) {
-	args := obj.(*HighNodeUtilizationArgs)
+	args := obj.(*HighNodeUtilizationCordonerArgs)
 	if args.Thresholds == nil {
 		args.Thresholds = nil
 	}
