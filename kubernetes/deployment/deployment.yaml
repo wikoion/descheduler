@@ -23,14 +23,14 @@ spec:
       containers:
         - name: descheduler
           image: us-docker.pkg.dev/influxdb2-artifacts/tubernetes/descheduler-cordoner:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command:
             - "/bin/descheduler"
           args:
             - "--policy-config-file"
             - "/policy-dir/policy.yaml"
             - "--descheduling-interval"
-            - "5m"
+            - "1m"
             - "--v"
             - "3"
           ports:

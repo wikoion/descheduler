@@ -61,6 +61,7 @@ type HighNodeUtilizationCordonerArgs struct {
 	metav1.TypeMeta         `json:",inline"`
 	HighNodeUtilizationArgs `json:",inline"`
 
+	NodeSelector         string `json:"nodeSelector,omitempty"`
 	MinTimeUnderutilized string `json:"minTimeUnderutilized,omitempty"`
 	MaxCordonDuration    string `json:"maxCordonDuration,omitempty"`
 }

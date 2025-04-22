@@ -34,6 +34,8 @@ import (
 	frameworktypes "sigs.k8s.io/descheduler/pkg/framework/types"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	drain "k8s.io/kubectl/pkg/drain"
 )
 
 const (
@@ -177,11 +179,73 @@ func (h *HighNodeUtilizationCordoner) Name() string {
 	return HighNodeUtilizationPluginName
 }
 
+func (h *HighNodeUtilizationCordoner) drainNode(ctx context.Context, nodeName string) error {
+	client := h.handle.ClientSet()
+
+	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node: %v", err)
+	}
+
+	// Skip if already cordoned
+	if !node.Spec.Unschedulable {
+		node.Spec.Unschedulable = true
+		_, err = client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to cordon node: %v", err)
+		}
+	}
+
+	// Setup the drain helper
+	drainer := &drain.Helper{
+		Ctx:                 ctx,
+		Client:              client,
+		Force:               true,
+		IgnoreAllDaemonSets: true,
+		DeleteEmptyDirData:  true,
+		Timeout:             0,
+		OnPodDeletedOrEvicted: func(pod *v1.Pod, usingEviction bool) {
+			klog.Infof("Pod %s/%s evicted (usingEviction=%v)", pod.Namespace, pod.Name, usingEviction)
+		},
+	}
+
+	// Drain the node
+	if err := drain.RunNodeDrain(drainer, nodeName); err != nil {
+		return fmt.Errorf("failed to drain node %s: %w", nodeName, err)
+	}
+
+	return nil
+}
+
 // Balance holds the main logic of the plugin. It evicts pods from under
 // utilized nodes. The goal here is to concentrate pods in fewer nodes so that
 // less nodes are used.
 func (h *HighNodeUtilizationCordoner) Balance(ctx context.Context, nodes []*v1.Node) *frameworktypes.Status {
-	if err := h.usageClient.sync(ctx, nodes); err != nil {
+	nodeSelector := labels.Everything() // default: match all nodes
+	if h.args.NodeSelector != "" {
+		parsedSelector, err := labels.Parse(h.args.NodeSelector)
+		if err != nil {
+			klog.ErrorS(err, "Invalid nodeSelector", "selector", h.args.NodeSelector)
+			return &frameworktypes.Status{Err: fmt.Errorf("invalid nodeSelector: %w", err)}
+		}
+		nodeSelector = parsedSelector
+	}
+
+	filteredNodes := []*v1.Node{}
+	for _, node := range nodes {
+		if nodeSelector.Matches(labels.Set(node.Labels)) {
+			filteredNodes = append(filteredNodes, node)
+		} else {
+			klog.V(2).InfoS("Node does not match nodeSelector, skipping", "node", node.Name)
+		}
+	}
+
+	if len(filteredNodes) == 0 {
+		klog.V(1).InfoS("No nodes matched the nodeSelector, skipping plugin logic")
+		return nil
+	}
+
+	if err := h.usageClient.sync(ctx, filteredNodes); err != nil {
 		return &frameworktypes.Status{
 			Err: fmt.Errorf("error getting node usage: %v", err),
 		}
@@ -189,8 +253,8 @@ func (h *HighNodeUtilizationCordoner) Balance(ctx context.Context, nodes []*v1.N
 
 	// take a picture of the current state of the nodes, everything else
 	// here is based on this snapshot.
-	nodesMap, nodesUsageMap, podListMap := getNodeUsageSnapshot(nodes, h.usageClient)
-	capacities := referencedResourceListForNodesCapacity(nodes)
+	nodesMap, nodesUsageMap, podListMap := getNodeUsageSnapshot(filteredNodes, h.usageClient)
+	capacities := referencedResourceListForNodesCapacity(filteredNodes)
 
 	// node usages are not presented as percentages over the capacity.
 	// we need to normalize them to be able to compare them with the
@@ -303,10 +367,10 @@ func (h *HighNodeUtilizationCordoner) Balance(ctx context.Context, nodes []*v1.N
 					klog.ErrorS(err, "Failed to parse cordon timestamp", "node", nodeName)
 					continue
 				}
-				// Uncordon if over max duration
+				// Drain if over max duration
 				if now.Sub(cordonTime) > maxCordonDuration {
-					klog.InfoS("Node cordoned too long, uncordoning", "node", nodeName)
-					if err := h.uncordonNode(ctx, nodeName); err != nil {
+					klog.InfoS("Node cordoned too long, draining", "node", nodeName)
+					if err := h.drainNode(ctx, nodeName); err != nil {
 						klog.ErrorS(err, "Failed to uncordon node", "node", nodeName)
 					}
 				}
