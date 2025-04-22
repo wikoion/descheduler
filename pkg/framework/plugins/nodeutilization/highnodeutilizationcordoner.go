@@ -1,0 +1,429 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package nodeutilization
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/descheduler/pkg/api"
+	nodeutil "sigs.k8s.io/descheduler/pkg/descheduler/node"
+
+	"k8s.io/apimachinery/pkg/types"
+	podutil "sigs.k8s.io/descheduler/pkg/descheduler/pod"
+	"sigs.k8s.io/descheduler/pkg/framework/plugins/nodeutilization/classifier"
+	"sigs.k8s.io/descheduler/pkg/framework/plugins/nodeutilization/normalizer"
+	frameworktypes "sigs.k8s.io/descheduler/pkg/framework/types"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	drain "k8s.io/kubectl/pkg/drain"
+)
+
+const (
+	HighNodeUtilizationCordonerPluginName = "HighNodeUtilizationCordoner"
+	NodeUnderUtilizedTimeAnnotation       = "descheduler.alpha.kubernetes.io/underutilized-since"
+	NodeTimeSinceCordonAnnotation         = "descheduler.alpha.kubernetes.io/cordoned-since"
+)
+
+// this lines makes sure that HighNodeUtilization implements the BalancePlugin
+// interface.
+var _ frameworktypes.BalancePlugin = &HighNodeUtilization{}
+
+// HighNodeUtilization evicts pods from under utilized nodes so that scheduler
+// can schedule according to its plugin. Note that CPU/Memory requests are used
+// to calculate nodes' utilization and not the actual resource usage.
+type HighNodeUtilizationCordoner struct {
+	handle         frameworktypes.Handle
+	args           *HighNodeUtilizationCordonerArgs
+	podFilter      func(pod *v1.Pod) bool
+	criteria       []any
+	resourceNames  []v1.ResourceName
+	highThresholds api.ResourceThresholds
+	usageClient    usageClient
+}
+
+// NewHighNodeUtilization builds plugin from its arguments while passing a handle.
+func NewHighNodeUtilizationCordoner(
+	genericArgs runtime.Object, handle frameworktypes.Handle,
+) (frameworktypes.Plugin, error) {
+	args, ok := genericArgs.(*HighNodeUtilizationCordonerArgs)
+	if !ok {
+		return nil, fmt.Errorf(
+			"want args to be of type HighNodeUtilizationCordonerArgs, got %T",
+			genericArgs,
+		)
+	}
+
+	// this plugins worries only about thresholds but the nodeplugins
+	// package was made to take two thresholds into account, one for low
+	// and another for high usage. here we make sure we set the high
+	// threshold to the maximum value for all resources for which we have a
+	// threshold.
+	highThresholds := make(api.ResourceThresholds)
+	for rname := range args.Thresholds {
+		highThresholds[rname] = MaxResourcePercentage
+	}
+
+	// criteria is a list of thresholds that are used to determine if a node
+	// is underutilized. it is used only for logging purposes.
+	criteria := []any{}
+	for rname, rvalue := range args.Thresholds {
+		criteria = append(criteria, rname, rvalue)
+	}
+
+	podFilter, err := podutil.
+		NewOptions().
+		WithFilter(handle.Evictor().Filter).
+		BuildFilterFunc()
+	if err != nil {
+		return nil, fmt.Errorf("error initializing pod filter function: %v", err)
+	}
+
+	// resourceNames is a list of all resource names this plugin cares
+	// about. we care about the resources for which we have a threshold and
+	// all we consider the basic resources (cpu, memory, pods).
+	resourceNames := uniquifyResourceNames(
+		append(
+			getResourceNames(args.Thresholds),
+			v1.ResourceCPU,
+			v1.ResourceMemory,
+			v1.ResourcePods,
+		),
+	)
+
+	return &HighNodeUtilizationCordoner{
+		handle:         handle,
+		args:           args,
+		resourceNames:  resourceNames,
+		highThresholds: highThresholds,
+		criteria:       criteria,
+		podFilter:      podFilter,
+		usageClient: newRequestedUsageClient(
+			resourceNames,
+			handle.GetPodsAssignedToNodeFunc(),
+		),
+	}, nil
+}
+
+func (h *HighNodeUtilizationCordoner) cordonNode(ctx context.Context, nodeName string) error {
+	client := h.handle.ClientSet()
+
+	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node: %v", err)
+	}
+
+	if node.Spec.Unschedulable {
+		return nil
+	}
+
+	node.Spec.Unschedulable = true
+	_, err = client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to cordon node: %v", err)
+	}
+
+	return nil
+}
+
+func (h *HighNodeUtilizationCordoner) uncordonNode(ctx context.Context, nodeName string) error {
+	client := h.handle.ClientSet()
+
+	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node %q: %w", nodeName, err)
+	}
+
+	if !node.Spec.Unschedulable {
+		klog.V(2).InfoS("Node is already schedulable", "node", nodeName)
+		return nil
+	}
+
+	node.Spec.Unschedulable = false
+
+	// Remove cordon timestamp annotation if present
+	if node.Annotations != nil {
+		delete(node.Annotations, NodeTimeSinceCordonAnnotation)
+	}
+
+	_, err = client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to uncordon node %q: %w", nodeName, err)
+	}
+
+	klog.InfoS("Successfully uncordoned node", "node", nodeName)
+	return nil
+}
+
+// Name retrieves the plugin name.
+func (h *HighNodeUtilizationCordoner) Name() string {
+	return HighNodeUtilizationPluginName
+}
+
+func (h *HighNodeUtilizationCordoner) drainNode(ctx context.Context, nodeName string) error {
+	client := h.handle.ClientSet()
+
+	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node: %v", err)
+	}
+
+	// Skip if already cordoned
+	if !node.Spec.Unschedulable {
+		node.Spec.Unschedulable = true
+		_, err = client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to cordon node: %v", err)
+		}
+	}
+
+	// Setup the drain helper
+	drainer := &drain.Helper{
+		Ctx:                 ctx,
+		Client:              client,
+		Force:               true,
+		IgnoreAllDaemonSets: true,
+		DeleteEmptyDirData:  true,
+		Timeout:             0,
+		Out:                 os.Stdout,
+		ErrOut:              os.Stderr,
+		OnPodDeletedOrEvicted: func(pod *v1.Pod, usingEviction bool) {
+			klog.Infof("Pod %s/%s evicted (usingEviction=%v)", pod.Namespace, pod.Name, usingEviction)
+		},
+	}
+
+	// Drain the node
+	if err := drain.RunNodeDrain(drainer, nodeName); err != nil {
+		return fmt.Errorf("failed to drain node %s: %w", nodeName, err)
+	}
+
+	return nil
+}
+
+// Balance holds the main logic of the plugin. It evicts pods from under
+// utilized nodes. The goal here is to concentrate pods in fewer nodes so that
+// less nodes are used.
+func (h *HighNodeUtilizationCordoner) Balance(ctx context.Context, nodes []*v1.Node) *frameworktypes.Status {
+	nodeSelector := labels.Everything() // default: match all nodes
+	if h.args.NodeSelector != "" {
+		parsedSelector, err := labels.Parse(h.args.NodeSelector)
+		if err != nil {
+			klog.ErrorS(err, "Invalid nodeSelector", "selector", h.args.NodeSelector)
+			return &frameworktypes.Status{Err: fmt.Errorf("invalid nodeSelector: %w", err)}
+		}
+		nodeSelector = parsedSelector
+	}
+
+	filteredNodes := []*v1.Node{}
+	for _, node := range nodes {
+		if nodeSelector.Matches(labels.Set(node.Labels)) {
+			filteredNodes = append(filteredNodes, node)
+		} else {
+			klog.V(2).InfoS("Node does not match nodeSelector, skipping", "node", node.Name)
+		}
+	}
+
+	if len(filteredNodes) == 0 {
+		klog.V(1).InfoS("No nodes matched the nodeSelector, skipping plugin logic")
+		return nil
+	}
+
+	if err := h.usageClient.sync(ctx, filteredNodes); err != nil {
+		return &frameworktypes.Status{
+			Err: fmt.Errorf("error getting node usage: %v", err),
+		}
+	}
+
+	// take a picture of the current state of the nodes, everything else
+	// here is based on this snapshot.
+	nodesMap, nodesUsageMap, podListMap := getNodeUsageSnapshot(filteredNodes, h.usageClient)
+	capacities := referencedResourceListForNodesCapacity(filteredNodes)
+
+	// node usages are not presented as percentages over the capacity.
+	// we need to normalize them to be able to compare them with the
+	// thresholds. thresholds are already provided by the user in
+	// percentage.
+	usage, thresholds := assessNodesUsagesAndStaticThresholds(
+		nodesUsageMap, capacities, h.args.Thresholds, h.highThresholds,
+	)
+
+	// classify nodes in two groups: underutilized and schedulable. we will
+	// later try to move pods from the first group to the second.
+	nodeGroups := classifier.Classify(
+		usage, thresholds,
+		// underutilized nodes.
+		func(nodeName string, usage, threshold api.ResourceThresholds) bool {
+			return isNodeBelowThreshold(usage, threshold)
+		},
+		// schedulable nodes.
+		func(nodeName string, usage, threshold api.ResourceThresholds) bool {
+			if nodeutil.IsNodeUnschedulable(nodesMap[nodeName]) {
+				klog.V(2).InfoS(
+					"Node is unschedulable",
+					"node", klog.KObj(nodesMap[nodeName]),
+				)
+				return false
+			}
+			return true
+		},
+	)
+
+	// the nodeplugin package works by means of NodeInfo structures. these
+	// structures hold a series of information about the nodes. now that
+	// we have classified the nodes, we can build the NodeInfo structures
+	// for each group. NodeInfo structs carry usage and available resources
+	// for each node.
+	nodeInfos := make([][]NodeInfo, 2)
+	category := []string{"underutilized", "overutilized"}
+	for i := range nodeGroups {
+		for nodeName := range nodeGroups[i] {
+			klog.InfoS(
+				"Node has been classified",
+				"category", category[i],
+				"node", klog.KObj(nodesMap[nodeName]),
+				"usage", nodesUsageMap[nodeName],
+				"usagePercentage", normalizer.Round(usage[nodeName]),
+			)
+			nodeInfos[i] = append(nodeInfos[i], NodeInfo{
+				NodeUsage: NodeUsage{
+					node:    nodesMap[nodeName],
+					usage:   nodesUsageMap[nodeName],
+					allPods: podListMap[nodeName],
+				},
+				available: capNodeCapacitiesToThreshold(
+					nodesMap[nodeName],
+					thresholds[nodeName][1],
+					h.resourceNames,
+				),
+			})
+		}
+	}
+
+	lowNodes, schedulableNodes := nodeInfos[0], nodeInfos[1]
+
+	klog.V(1).InfoS("Criteria for a node below target utilization", h.criteria...)
+	klog.V(1).InfoS("Number of underutilized nodes", "totalNumber", len(lowNodes))
+
+	if len(lowNodes) == 0 {
+		klog.V(1).InfoS(
+			"No node is underutilized, nothing to do here, you might tune your thresholds further",
+		)
+		return nil
+	}
+
+	if len(lowNodes) <= h.args.NumberOfNodes {
+		klog.V(1).InfoS(
+			"Number of nodes underutilized is less or equal than NumberOfNodes, nothing to do here",
+			"underutilizedNodes", len(lowNodes),
+			"numberOfNodes", h.args.NumberOfNodes,
+		)
+		return nil
+	}
+
+	if len(lowNodes) == len(nodes) {
+		klog.V(1).InfoS("All nodes are underutilized, nothing to do here")
+		return nil
+	}
+
+	if len(schedulableNodes) == 0 {
+		klog.V(1).InfoS("No node is available to schedule the pods, nothing to do here")
+		return nil
+	}
+
+	// sorts the nodes by the usage in ascending order.
+	sortNodesByUsage(lowNodes, true)
+
+	minUnderutilized, _ := time.ParseDuration(h.args.MinTimeUnderutilized)
+	maxCordonDuration, _ := time.ParseDuration(h.args.MaxCordonDuration)
+	now := time.Now()
+
+	for _, nodeInfo := range lowNodes {
+		node := nodeInfo.node
+		nodeName := node.Name
+
+		// Check if node is cordoned
+		if node.Spec.Unschedulable {
+			// Check cordon annotation
+			if ts, ok := node.Annotations[NodeTimeSinceCordonAnnotation]; ok {
+				cordonTime, err := time.Parse(time.RFC3339, ts)
+				if err != nil {
+					klog.ErrorS(err, "Failed to parse cordon timestamp", "node", nodeName)
+					continue
+				}
+				// Drain if over max duration
+				if now.Sub(cordonTime) > maxCordonDuration {
+					klog.InfoS("Node cordoned too long, draining", "node", nodeName)
+					if err := h.drainNode(ctx, nodeName); err != nil {
+						klog.ErrorS(err, "Failed to drain node", "node", nodeName)
+					}
+				}
+			}
+			continue
+		}
+
+		// Skip if already being tracked as underutilized
+		firstSeenStr := node.Annotations[NodeUnderUtilizedTimeAnnotation]
+		var firstSeen time.Time
+		var err error
+
+		if firstSeenStr != "" {
+			firstSeen, err = time.Parse(time.RFC3339, firstSeenStr)
+			if err != nil {
+				klog.ErrorS(err, "Failed to parse underutilized timestamp", "node", nodeName)
+				continue
+			}
+		} else {
+			// Annotate node with current time as first underutilized
+			patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`,
+				NodeUnderUtilizedTimeAnnotation, now.Format(time.RFC3339))
+			_, err := h.handle.ClientSet().CoreV1().Nodes().Patch(ctx, nodeName,
+				types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+			if err != nil {
+				klog.ErrorS(err, "Failed to annotate node with underutilized timestamp", "node", nodeName)
+			} else {
+				klog.InfoS("Annotated node as underutilized", "node", nodeName)
+			}
+			continue
+		}
+
+		// If underutilized long enough, cordon
+		if now.Sub(firstSeen) > minUnderutilized {
+			klog.InfoS("Cordon threshold met, cordoning node", "node", nodeName)
+			if err := h.cordonNode(ctx, nodeName); err != nil {
+				klog.ErrorS(err, "Failed to cordon node", "node", nodeName)
+			} else {
+				// Set cordon timestamp
+				patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`,
+					NodeTimeSinceCordonAnnotation, now.Format(time.RFC3339))
+				_, err := h.handle.ClientSet().CoreV1().Nodes().Patch(ctx, nodeName,
+					types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+				if err != nil {
+					klog.ErrorS(err, "Failed to annotate node with cordon timestamp", "node", nodeName)
+				}
+			}
+			break // Only cordon one node at a time
+		}
+	}
+
+	return nil
+}

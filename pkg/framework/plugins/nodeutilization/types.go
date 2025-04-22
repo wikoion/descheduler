@@ -54,6 +54,18 @@ type HighNodeUtilizationArgs struct {
 	EvictableNamespaces *api.Namespaces `json:"evictableNamespaces,omitempty"`
 }
 
+// +k8s:deepcopy-gen=true
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+type HighNodeUtilizationCordonerArgs struct {
+	metav1.TypeMeta         `json:",inline"`
+	HighNodeUtilizationArgs `json:",inline"`
+
+	NodeSelector         string `json:"nodeSelector,omitempty"`
+	MinTimeUnderutilized string `json:"minTimeUnderutilized,omitempty"`
+	MaxCordonDuration    string `json:"maxCordonDuration,omitempty"`
+}
+
 // MetricsUtilization allow to consume actual resource utilization from metrics
 // +k8s:deepcopy-gen=true
 type MetricsUtilization struct {
